@@ -1,0 +1,19 @@
+{
+  "base_url": "https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent",
+  "login": {
+    "email_selectors": ["input[type='email']", "input[name='email']", "input[id*='email']", "input[placeholder*='Email']"],
+    "password_selectors": ["input[type='password']", "input[name='password']", "input[id*='password']"],
+    "login_button_selectors": ["button[type='submit']", "button:has-text('Sign in')", "button:has-text('Log in')"]
+  },
+  "open_new_selectors": ["button:has-text('Add')", "button:has-text('+ New ticket')", "button:has-text('New')", "a[href*='/agent/tickets/new']"],
+  "fields": {
+    "subject": ["input[placeholder='Subject']", "input[placeholder*='Subject']", "input[id*='ticket_subject']", "textarea[placeholder='Subject']", "div:has-text('Subject') input"],
+    "description": ["textarea[name='comment']", "textarea[name='description']", "textarea[id*='comment']", "div[role='textbox'][contenteditable='true']", "div[contenteditable='true']"],
+    "requester": ["input[placeholder*='Search or add requester']", "input[aria-label*='requester']", "input[placeholder*='Requester']", "input[name*='requester']"],
+    "assignee": ["input[placeholder*='Search or add assignee']", "input[aria-label*='assignee']", "input[placeholder*='Assignee']"],
+    "tags": ["input[placeholder*='Add a tag']", "input[placeholder*='Tags']"],
+    "type": ["select[name='type']"],
+    "priority": ["select[name='priority']"]
+  },
+  "submit_selectors": ["button:has-text('Submit as New')", "button:has-text('Submit')", "button:has-text('Save')", "button:has-text('Create')"]
+}

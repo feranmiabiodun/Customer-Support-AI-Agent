@@ -1,0 +1,16 @@
+{
+  "base_url": "https://{FRESHDESK_DOMAIN}.freshdesk.com/",
+  "login": {
+    "email_selectors": ["input[type='email']", "input[name='email']", "input[id*='email']", "input[placeholder*='Email']"],
+    "password_selectors": ["input[type='password']", "input[name='password']", "input[id*='password']"],
+    "login_button_selectors": ["button[type='submit']", "button:has-text('Sign in')", "button:has-text('Log in')"]
+  },
+  "open_new_selectors": ["a:has-text('New Ticket')", "button:has-text('New Ticket')", "button:has-text('New')", "a[href*='/a/tickets/new']"],
+  "fields": {
+    "subject": ["input[name='subject']", "input[id*='subject']", "input[placeholder*='Subject']"],
+    "description": ["textarea[name='description']", "textarea[id*='description']", "div[role='textbox'][contenteditable='true']"],
+    "requester": ["input[name='email']", "input[placeholder*='Email']", "input[id*='email']"],
+    "priority": ["select[name='priority']"]
+  },
+  "submit_selectors": ["button:has-text('Save')", "button:has-text('Create')", "button:has-text('Submit')"]
+}
