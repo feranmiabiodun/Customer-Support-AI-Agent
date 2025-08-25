@@ -1,16 +1,30 @@
 {
-  "base_url": "https://{FRESHDESK_DOMAIN}.freshdesk.com/",
+  "base_url": "https://{FRESHDESK_DOMAIN}.freshdesk.com/a/tickets/new",
   "login": {
     "email_selectors": ["input[type='email']", "input[name='email']", "input[id*='email']", "input[placeholder*='Email']"],
     "password_selectors": ["input[type='password']", "input[name='password']", "input[id*='password']"],
     "login_button_selectors": ["button[type='submit']", "button:has-text('Sign in')", "button:has-text('Log in')"]
   },
+  "passcode_selectors": ["input[name='otp']", "input[type='tel']", "input[id*='otp']", "input[id*='code']", "input[name*='code']"],
+  "passcode_submit_selectors": ["button:has-text('Verify')", "button:has-text('Continue')", "button:has-text('Submit')", "button[type='submit']"],
   "open_new_selectors": ["a:has-text('New Ticket')", "button:has-text('New Ticket')", "button:has-text('New')", "a[href*='/a/tickets/new']"],
-  "fields": {
-    "subject": ["input[name='subject']", "input[id*='subject']", "input[placeholder*='Subject']"],
-    "description": ["textarea[name='description']", "textarea[id*='description']", "div[role='textbox'][contenteditable='true']"],
-    "requester": ["input[name='email']", "input[placeholder*='Email']", "input[id*='email']"],
-    "priority": ["select[name='priority']"]
+  "requester": {
+    "input_selectors": ["input[placeholder*='Search or add requester']", "input[aria-label*='requester']", "input[placeholder*='Requester']", "input[name*='requester']"],
+    "result_item_selectors": [".ember-basic-dropdown-content li", ".ac_results li", ".autocomplete-item", "ul[role='listbox'] li", "li[role='option']"]
   },
+  "assignee": {
+    "input_selectors": ["input[placeholder*='Search or add assignee']", "input[aria-label*='assignee']", "input[placeholder*='Assignee']"],
+    "result_item_selectors": [".ember-basic-dropdown-content li", ".ac_results li", ".autocomplete-item", "ul[role='listbox'] li", "li[role='option']"]
+  },
+  "tags": {
+    "input_selectors": ["input[placeholder*='Add a tag']", "input[placeholder*='Tags']", "input[name*='tags']"],
+    "add_button_selectors": ["button:has-text('+ Add Tag')", "button:has-text('Add tag')", "button:has-text('Add')"]
+  },
+  "fields": {
+    "subject": ["input[name='subject']", "input[id*='subject']", "input[placeholder*='Subject']", "textarea[id*='subject']"],
+    "description": ["div[role='textbox'][contenteditable='true']", "textarea[name='description']", "textarea[id*='comment']", "div[contenteditable='true']"]
+  },
+  "type_selectors": ["select[name='type']", "select[id*='ticket_type']", "button:has-text('Type')", "div[aria-label='Type']"],
+  "priority_selectors": ["select[name='priority']", "select[id*='priority']", "button:has-text('Priority')"],
   "submit_selectors": ["button:has-text('Save')", "button:has-text('Create')", "button:has-text('Submit')"]
 }

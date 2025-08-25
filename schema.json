@@ -34,6 +34,21 @@
     "metadata": {
       "type": "object",
       "additionalProperties": true
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "action": { "type": "string" },
+          "selector_candidates": { "type": "array", "items": { "type": "string" } },
+          "selector": { "type": "string" },
+          "target": { "type": "string" },
+          "value_source": { "type": "string" },
+          "value": {}
+        },
+        "additionalProperties": true
+      }
     }
   },
   "additionalProperties": false

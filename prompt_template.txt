@@ -1,3 +1,4 @@
+# prompt_template.txt
 You are a strict JSON-only parser.  
 Read the user instruction below (replace <<USER_INSTRUCTION>> with the user's text) and return ONLY one JSON OBJECT (no surrounding text, no code fences, no explanations) that matches the following schema exactly.
 
@@ -17,13 +18,13 @@ Schema (required shape):
 
 Rules (follow these exactly):
 1. Return ONLY a single JSON object that conforms to the schema above.
-2. The top-level property `"action"` must be present and set to the literal string: "create_ticket".
-3. `requester` MUST be an object containing at least `"email"` with a valid email string. If user gave only an email, set requester.email to that email. If user gave a name and email (e.g. "Bob <bob@example.com>"), populate requester.name and requester.email accordingly.
-4. `priority` must be one of: "low", "medium", or "high" (lowercase).
-5. `providers`, if present, must be an array of strings (e.g., ["zendesk", "freshdesk"]).
+2. The top-level property "action" must be present and set to the literal string: "create_ticket".
+3. requester MUST be an object containing at least "email" with a valid email string. If user gave only an email, set requester.email to that email. If user gave a name and email (e.g. "Bob <bob@example.com>"), populate requester.name and requester.email accordingly.
+4. priority must be one of: "low", "medium", or "high" (lowercase).
+5. providers, if present, must be an array of strings (e.g., ["zendesk", "freshdesk"]).
 6. Do NOT include any additional top-level fields not listed in the schema.
 7. Do NOT include comments, explanations, or code fences in your response.
-8. If the user instruction lacks required information (for example no requester email), return a JSON object with the fields you can infer and put an extra field `metadata: {"missing": ["requester.email"]}` so the caller can see what is missing. (Still follow rules above: no other extra top-level keys.)
+8. If the user instruction lacks required information (for example no requester email), return a JSON object with the fields you can infer and put an extra field metadata: {"missing": ["requester.email"]} so the caller can see what is missing. (Still follow rules above: no other extra top-level keys.)
 
 Now parse this instruction and return the JSON object only:
 

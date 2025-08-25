@@ -3,13 +3,15 @@
 """
 GenericUIAgent (config-driven).
 
-This agent:
-- Loads provider configs from `providers/*.json` if present (falls back to inline defaults).
-- Attempts to use LLM (via parser.call_groq + parser.extract_json_from_response) to infer DOM steps
-  from a live page when `intent["steps"]` is missing.
-- Executes DOM steps robustly using safe_fill/safe_click, with label fallbacks and iframe handling.
-- Persists run-scoped JSON-lines logs (redacted) for step-level auditing and selector stats for recoverability.
-- Falls back to adapters for API ticket creation when UI flow hits SSO/login or missing required fields.
+- IMAP-based passcode (2FA) retrieval (preferred for Gmail reliability).
+- Browser-inbox passcode fallback (best-effort).
+- Automated username/password login attempts using provider login selectors.
+- SSO detection with manual-wait + adapter fallback.
+- Multi-strategy submit (selectors, frames, JS click, keyboard, form.submit()) with disabled-attribute workaround.
+- Optional OCR (pytesseract) for screenshot -> text augmentation to LLM.
+- LLM-chain inference: includes a redacted DOM snippet and optional OCR text when calling LLM.
+- Selector scoring and persistence, structured redacted logs, diagnostics saving.
+- Adapter resolution via adapters.get_adapter registry (providers can be pluggable).
 """
 from __future__ import annotations
 import os
@@ -24,17 +26,24 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-# reuse adapters for API fallback
-from adapters import zendesk_adapter, freshdesk_adapter
-
-# reuse parser LLM wrappers
+from adapters import get_adapter  # dynamic adapter registry (best-effort)
 import parser as parser_mod
+
+# optional OCR
+try:
+    from PIL import Image
+    import pytesseract
+    _OCR_AVAILABLE = True
+except Exception:
+    _OCR_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 DEFAULT_TIMEOUT = int(os.getenv("UI_AGENT_TIMEOUT_MS", "45000"))
 SHORT_TIMEOUT = int(os.getenv("UI_AGENT_SHORT_TIMEOUT_MS", "8000"))
+SSO_MANUAL_WAIT_MS = int(os.getenv("UI_AGENT_SSO_MANUAL_WAIT_MS", str(60 * 1000)))  # default 60s
+POST_PASSCODE_WAIT_MS = int(os.getenv("UI_AGENT_POST_PASSCODE_WAIT_MS", str(20000)))  # default 20s
 
 PROVIDERS_DIR = pathlib.Path("providers")
 LOG_DIR = pathlib.Path(os.getenv("UI_AGENT_DIAG_DIR", "./ui_agent_diag"))
@@ -42,59 +51,25 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "steps.jsonl"
 SELECTOR_STATS_FILE = LOG_DIR / "selector_stats.json"
 
-_EMAIL_RE = re.compile(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})")
+_SAVE_RAW_DIAGNOSTICS = os.getenv("UI_AGENT_SAVE_RAW_DIAGNOSTICS", "false").strip().lower() in ("1", "true", "yes")
+_DEBUG_RETURN_RAW = os.getenv("DEBUG_RETURN_RAW_API_RESPONSES", "false").strip().lower() in ("1", "true", "yes")
 
-# Default inline provider configs (fallback if providers/*.json not present)
-INLINE_PROVIDER_CONFIGS: Dict[str, Dict[str, Any]] = {
-    "zendesk": {
-        "base_url": "https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent",
-        "login": {
-            "email_selectors": ["input[type='email']", "input[name='email']", "input[id*='email']", "input[placeholder*='Email']"],
-            "password_selectors": ["input[type='password']", "input[name='password']", "input[id*='password']"],
-            "login_button_selectors": ["button[type='submit']", "button:has-text('Sign in')", "button:has-text('Log in')"]
-        },
-        "open_new_selectors": ["button:has-text('Add')", "button:has-text('+ New ticket')", "button:has-text('New')", "a[href*='/agent/tickets/new']"],
-        "fields": {
-            "subject": ["input[placeholder='Subject']", "input[placeholder*='Subject']", "input[id*='ticket_subject']", "textarea[placeholder='Subject']", "div:has-text('Subject') input"],
-            "description": ["textarea[name='comment']", "textarea[name='description']", "textarea[id*='comment']", "div[role='textbox'][contenteditable='true']", "div[contenteditable='true']"],
-            "requester": ["input[placeholder*='Search or add requester']", "input[aria-label*='requester']", "input[placeholder*='Requester']", "input[name*='requester']"],
-            "assignee": ["input[placeholder*='Search or add assignee']", "input[aria-label*='assignee']", "input[placeholder*='Assignee']"],
-            "tags": ["input[placeholder*='Add a tag']", "input[placeholder*='Tags']"],
-            "type": ["select[name='type']"],
-            "priority": ["select[name='priority']"],
-        },
-        "submit_selectors": ["button:has-text('Submit as New')", "button:has-text('Submit')", "button:has-text('Save')", "button:has-text('Create')"]
-    },
-    "freshdesk": {
-        "base_url": "https://{FRESHDESK_DOMAIN}.freshdesk.com/",
-        "login": {
-            "email_selectors": ["input[type='email']", "input[name='email']", "input[id*='email']", "input[placeholder*='Email']"],
-            "password_selectors": ["input[type='password']", "input[name='password']", "input[id*='password']"],
-            "login_button_selectors": ["button[type='submit']", "button:has-text('Sign in')", "button:has-text('Log in')"]
-        },
-        "open_new_selectors": ["a:has-text('New Ticket')", "button:has-text('New Ticket')", "button:has-text('New')", "a[href*='/a/tickets/new']"],
-        "fields": {
-            "subject": ["input[name='subject']", "input[id*='subject']", "input[placeholder*='Subject']"],
-            "description": ["textarea[name='description']", "textarea[id*='description']", "div[role='textbox'][contenteditable='true']"],
-            "requester": ["input[name='email']", "input[placeholder*='Email']", "input[id*='email']"],
-            "priority": ["select[name='priority']"],
-        },
-        "submit_selectors": ["button:has-text('Save')", "button:has-text('Create')", "button:has-text('Submit')"]
-    }
-}
+_EMAIL_RE = re.compile(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})")
+_SSO_BUTTON_PATTERNS = [
+    "Sign in with", "Continue with", "Sign in using", "Sign in to your", "Use SSO", "Single Sign-On",
+    "Sign in with Google", "Sign in with Microsoft", "Sign in with Okta", "Sign in with SSO"
+]
 
 
 def _redact_text(s: str) -> str:
     if not isinstance(s, str):
         return s
     s = _EMAIL_RE.sub("[REDACTED_EMAIL]", s)
-    # common API key patterns
     s = re.sub(r"(?i)(api[_-]?key|token)[\"']?\s*[:=]\s*['\"]?[\w\-\.]{8,}['\"]?", r"\1: [REDACTED]", s)
     return s
 
 
 def _redact_obj(obj: Any) -> Any:
-    """Recursively redact strings inside JSON-like structures."""
     if isinstance(obj, dict):
         return {k: _redact_obj(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -105,19 +80,18 @@ def _redact_obj(obj: Any) -> Any:
 
 
 def _load_provider_configs() -> Dict[str, Dict[str, Any]]:
-    """Load JSON provider configs from providers/ if present, else fallback to inline defaults."""
-    configs = {}
-    if PROVIDERS_DIR.exists() and PROVIDERS_DIR.is_dir():
-        for p in PROVIDERS_DIR.glob("*.json"):
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-                configs[p.stem] = data
-            except Exception:
-                logger.debug("Failed to load provider config %s", p, exc_info=True)
-    # merge with inline defaults (do not overwrite any user-provided file)
-    merged = dict(INLINE_PROVIDER_CONFIGS)
-    merged.update(configs)
-    return merged
+    configs: Dict[str, Dict[str, Any]] = {}
+    if not PROVIDERS_DIR.exists() or not PROVIDERS_DIR.is_dir():
+        raise RuntimeError("providers directory not found: providers/ -- it must contain provider JSON files (e.g. zendesk.json, freshdesk.json)")
+    for p in PROVIDERS_DIR.glob("*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            configs[p.stem] = data
+        except Exception:
+            logger.debug("Failed to load provider config %s", p, exc_info=True)
+    if not configs:
+        raise RuntimeError("No provider JSON files found in providers/; at least one provider config is required")
+    return configs
 
 
 def _append_logline(log_obj: Dict[str, Any]) -> None:
@@ -152,10 +126,8 @@ class GenericUIAgent:
         self.user_data_dir = user_data_dir or os.getenv("PLAYWRIGHT_USER_DATA_DIR")
         self.provider_configs = _load_provider_configs()
         self.selector_stats = _load_selector_stats()
-        # current run context
         self._run_id: Optional[str] = None
 
-    # ----------------- browser mgmt --------------------------------------
     def _launch(self, p):
         if self.user_data_dir:
             ctx = p.chromium.launch_persistent_context(user_data_dir=self.user_data_dir, headless=self.headless, slow_mo=self.slow_mo or 0)
@@ -172,17 +144,10 @@ class GenericUIAgent:
         except Exception:
             logger.debug("Error closing browser/context", exc_info=True)
 
-    # ------------- structured logging -----------------------------------
     def _log_step(self, event: str, step: Dict[str, Any], extra: Optional[Dict[str, Any]] = None):
-        payload = {
-            "run_id": self._run_id,
-            "ts": time.time(),
-            "event": event,
-            "step": step
-        }
+        payload = {"run_id": self._run_id, "ts": time.time(), "event": event, "step": step}
         if extra:
             payload.update({"extra": extra})
-        # redact before writing logs
         try:
             safe = _redact_obj(payload)
             logger.info(json.dumps(safe))
@@ -190,7 +155,6 @@ class GenericUIAgent:
         except Exception:
             logger.info("STEPLOG %s %s", event, payload)
 
-    # ------------- diagnostics ------------------------------------------
     def save_diagnostic(self, page, provider_name: str):
         try:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -203,28 +167,33 @@ class GenericUIAgent:
                 logger.debug("screenshot failed", exc_info=True)
             try:
                 content = page.content()
-                # redact html content minimally (emails)
-                content = _redact_text(content)
+                if not _SAVE_RAW_DIAGNOSTICS:
+                    content = _redact_text(content)
                 html.write_text(content, encoding="utf-8")
             except Exception:
                 logger.debug("html save failed", exc_info=True)
         except Exception:
             logger.debug("diagnostic save failed", exc_info=True)
 
-    # ------------- DOM heuristics ---------------------------------------
+    def _screenshot_to_text(self, page) -> str:
+        if not _OCR_AVAILABLE:
+            return ""
+        try:
+            tmp = LOG_DIR / f"ocr_{int(time.time())}.png"
+            page.screenshot(path=str(tmp), full_page=True)
+            text = pytesseract.image_to_string(Image.open(str(tmp)))
+            return text[:120000]
+        except Exception:
+            logger.debug("OCR failed", exc_info=True)
+            return ""
+
     def find_field_by_label(self, page, label_text: str, timeout: int = 500) -> Optional[str]:
-        """
-        Heuristic: try to locate an input/textarea/contenteditable near a label that contains label_text.
-        If not found, try placeholder / aria-label selectors that contain the label text.
-        Returns a selector string or None.
-        """
         try:
             labels = page.query_selector_all("label")
             for lbl in labels:
                 try:
                     txt = (lbl.inner_text() or "").strip()
                     if label_text.lower() in txt.lower():
-                        # If label has a 'for' attribute, prefer that element id
                         for_attr = lbl.get_attribute("for")
                         if for_attr:
                             cand = f"#{for_attr}"
@@ -233,7 +202,6 @@ class GenericUIAgent:
                                 return cand
                             except Exception:
                                 pass
-                        # Otherwise, look for sibling inputs/textarea/contenteditable
                         for sel in ["input", "textarea", "div[contenteditable='true']"]:
                             try:
                                 rs = lbl.query_selector_all(f":scope ~ {sel}")
@@ -245,14 +213,9 @@ class GenericUIAgent:
                                 if eid:
                                     return f"#{eid}"
                                 else:
-                                    # return a generic selector relative to label scope
                                     return sel
                 except Exception:
-                    # ignore issues reading an individual label and continue
                     continue
-
-            # Fallback: try placeholder / aria-label selectors containing the label text.
-            # Use .format to avoid nested quote issues inside f-strings.
             cand = "input[placeholder*='{0}'], textarea[placeholder*='{0}'], input[aria-label*='{0}']".format(label_text)
             try:
                 page.wait_for_selector(cand, timeout=timeout)
@@ -262,9 +225,7 @@ class GenericUIAgent:
         except Exception:
             return None
 
-    # ------------- robust primitives -----------------------------------
     def _score_and_order_selectors(self, selectors: List[str]) -> List[str]:
-        # order selectors by historical success rate (stored in self.selector_stats)
         def score(s):
             st = self.selector_stats.get(s, {})
             tries = st.get("tries", 0)
@@ -280,7 +241,6 @@ class GenericUIAgent:
         st["tries"] += 1
         if success:
             st["successes"] += 1
-        # persist stats periodically
         try:
             _save_selector_stats(self.selector_stats)
         except Exception:
@@ -296,12 +256,37 @@ class GenericUIAgent:
                     page.wait_for_selector(s, timeout=timeout)
                     try:
                         page.fill(s, value)
+                        try:
+                            page.dispatch_event(s, "input", {"data": value})
+                        except Exception:
+                            pass
+                        try:
+                            page.dispatch_event(s, "change")
+                        except Exception:
+                            pass
+                        try:
+                            page.dispatch_event(s, "blur")
+                        except Exception:
+                            pass
+                        try:
+                            page.focus(s)
+                            page.press(s, "Tab")
+                        except Exception:
+                            pass
+                        try:
+                            page.wait_for_timeout(200)
+                        except Exception:
+                            pass
                         self._log_step("fill_success", {"selector": s})
                         self._update_selector_stats(s, True)
                         return True, s
                     except Exception:
                         try:
-                            page.eval_on_selector(s, "(el, v) => { if (el.isContentEditable) el.innerText = v; else if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') el.value = v; }", value)
+                            page.eval_on_selector(s, "(el, v) => { if (el.isContentEditable) el.innerText = v; else if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') el.value = v; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }", value)
+                            try:
+                                page.wait_for_timeout(200)
+                            except Exception:
+                                pass
                             self._log_step("fill_success_eval", {"selector": s})
                             self._update_selector_stats(s, True)
                             return True, s
@@ -311,7 +296,6 @@ class GenericUIAgent:
                     self._log_step("fill_selector_timeout", {"selector": s})
                 except Exception:
                     self._log_step("fill_selector_error", {"selector": s, "exc": traceback.format_exc()[:400]})
-                # mark failure attempt
                 self._update_selector_stats(s, False)
         return False, None
 
@@ -333,6 +317,664 @@ class GenericUIAgent:
                     self._log_step("click_error", {"selector": s, "exc": traceback.format_exc()[:400], "attempt": attempt + 1})
                 self._update_selector_stats(s, False)
         return False, None
+
+    def _attempt_submit(self, page, cfg: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+        candidates = []
+        if cfg:
+            candidates += cfg.get("submit_selectors", []) or []
+        candidates += [
+            "button:has-text('Submit as New')",
+            "button:has-text('Submit')",
+            "button:has-text('Save')",
+            "button[type='submit']",
+            "input[type='submit']",
+            "button:has-text('Create')",
+            "button[aria-label='Submit']"
+        ]
+        seen = set()
+        dedup = []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                dedup.append(c)
+
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+        try:
+            frames = [page] + list(page.frames)
+        except Exception:
+            frames = [page]
+
+        for frame in frames:
+            for s in dedup:
+                try:
+                    try:
+                        if not frame.query_selector(s):
+                            continue
+                    except Exception:
+                        pass
+
+                    try:
+                        frame.wait_for_selector(s, timeout=SHORT_TIMEOUT)
+                    except Exception:
+                        pass
+
+                    try:
+                        disabled = frame.eval_on_selector(s, "el => !!(el.disabled || el.getAttribute && el.getAttribute('aria-disabled')==='true')")
+                    except Exception:
+                        disabled = False
+                    if disabled:
+                        try:
+                            frame.eval_on_selector(s, "el => { try { if (el.hasAttribute && el.hasAttribute('disabled')) el.removeAttribute('disabled'); if (el.getAttribute && el.getAttribute('aria-disabled')==='true') el.setAttribute('aria-disabled','false'); } catch(e){} }")
+                        except Exception:
+                            pass
+
+                    try:
+                        frame.click(s, timeout=SHORT_TIMEOUT)
+                        self._log_step("submit_clicked_frame", {"frame": getattr(frame, 'name', '<frame>'), "selector": s})
+                        return True, s
+                    except Exception:
+                        try:
+                            frame.eval_on_selector(s, "el => el.click()")
+                            self._log_step("submit_js_click_frame", {"frame": getattr(frame, 'name', '<frame>'), "selector": s})
+                            return True, s
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+
+        try:
+            try:
+                page.keyboard.down("Control")
+                page.keyboard.press("Enter")
+                page.keyboard.up("Control")
+            except Exception:
+                page.keyboard.press("Enter")
+            self._log_step("submit_keyboard_attempt", {})
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                pass
+            return True, "keyboard"
+        except Exception:
+            pass
+
+        try:
+            res = page.evaluate("""() => {
+                const f = document.querySelector('form');
+                if (f) { try { f.submit(); return true } catch(e) { return false } }
+                return false;
+            }""")
+            if res:
+                self._log_step("submit_form_submit", {})
+                return True, "form.submit()"
+        except Exception:
+            pass
+
+        return False, None
+
+    # ---------------- PASSCODE (IMAP + browser fallback) helpers ----------------
+    def _detect_passcode_prompt(self, page, cfg: Optional[Dict[str, Any]] = None) -> bool:
+        try:
+            selectors = []
+            if isinstance(cfg, dict) and cfg.get("passcode_selectors"):
+                selectors = cfg.get("passcode_selectors") or []
+            selectors += [
+                "input[type='tel']",
+                "input[type='text'][inputmode='numeric']",
+                "input[name*='code']",
+                "input[id*='code']",
+                "input[name*='otp']",
+                "input[id*='otp']",
+                "input[placeholder*='code']",
+                "input[placeholder*='OTP']",
+                "input[aria-label*='code']",
+            ]
+            for s in selectors:
+                try:
+                    el = page.query_selector(s)
+                    if el:
+                        return True
+                except Exception:
+                    continue
+            try:
+                body = page.inner_text("body")[:3000].lower()
+                if any(t in body for t in ("enter the code", "enter the passcode", "verification code", "one-time code", "we sent a code", "verify you")):
+                    return True
+            except Exception:
+                pass
+            return False
+        except Exception:
+            return False
+
+    def _fetch_passcode_via_imap(self, cfg: Optional[Dict[str, Any]] = None, timeout_seconds: int = 30, poll_interval: float = 3.0) -> Optional[str]:
+        host = os.getenv("EMAIL_IMAP_HOST", "imap.gmail.com")
+        port = int(os.getenv("EMAIL_IMAP_PORT", "993"))
+        user = os.getenv("EMAIL_IMAP_USER")
+        password = os.getenv("EMAIL_IMAP_PASSWORD")
+        if not user or not password:
+            logger.debug("IMAP credentials not configured; skipping IMAP passcode fetch")
+            return None
+
+        subject_re = os.getenv("EMAIL_PASSCODE_SUBJECT_REGEX") or (cfg.get("passcode_email_subject_regex") if isinstance(cfg, dict) else None)
+        if not subject_re:
+            subject_re = r"(verification code|security code|one-time code|passcode|verification)"
+
+        code_re = os.getenv("EMAIL_PASSCODE_REGEX") or (cfg.get("passcode_regex") if isinstance(cfg, dict) else None)
+        if not code_re:
+            code_re = r"(\d{4,8})"
+
+        deadline = time.time() + float(timeout_seconds)
+        try:
+            import imaplib, email as _email_lib
+        except Exception:
+            logger.debug("imaplib/email not available", exc_info=True)
+            return None
+
+        while time.time() < deadline:
+            try:
+                imap = imaplib.IMAP4_SSL(host, port)
+                try:
+                    imap.login(user, password)
+                except Exception as e:
+                    logger.debug("IMAP login failed: %s", e)
+                    try:
+                        imap.logout()
+                    except Exception:
+                        pass
+                    return None
+
+                folder = os.getenv("EMAIL_IMAP_FOLDER", "INBOX")
+                try:
+                    imap.select(folder)
+                except Exception:
+                    try:
+                        imap.select()
+                    except Exception:
+                        pass
+
+                typ, data = imap.search(None, "ALL")
+                if typ != "OK":
+                    try:
+                        imap.logout()
+                    except Exception:
+                        pass
+                    time.sleep(poll_interval)
+                    continue
+
+                ids = data[0].split()
+                recent_ids = ids[-50:] if ids else []
+                for mid in reversed(recent_ids):
+                    try:
+                        typ, msg_data = imap.fetch(mid, "(RFC822)")
+                        if typ != "OK" or not msg_data or not msg_data[0]:
+                            continue
+                        raw = msg_data[0][1]
+                        if not raw:
+                            continue
+                        msg = _email_lib.message_from_bytes(raw)
+                        subj = (msg.get("Subject") or "")
+                        if re.search(subject_re, subj, re.IGNORECASE):
+                            body_text = ""
+                            if msg.is_multipart():
+                                for part in msg.walk():
+                                    ctype = part.get_content_type()
+                                    disp = str(part.get("Content-Disposition") or "")
+                                    if ctype == "text/plain" and "attachment" not in disp:
+                                        try:
+                                            payload = part.get_payload(decode=True)
+                                            if payload:
+                                                body_text += payload.decode(errors="ignore")
+                                        except Exception:
+                                            pass
+                            else:
+                                try:
+                                    payload = msg.get_payload(decode=True)
+                                    if payload:
+                                        body_text = payload.decode(errors="ignore")
+                                except Exception:
+                                    body_text = ""
+                            m = re.search(code_re, body_text)
+                            if m:
+                                code = m.group(1)
+                                try:
+                                    imap.logout()
+                                except Exception:
+                                    pass
+                                return code
+                    except Exception:
+                        continue
+                try:
+                    imap.logout()
+                except Exception:
+                    pass
+            except Exception:
+                logger.debug("IMAP fetch exception: %s", traceback.format_exc()[:400])
+            time.sleep(poll_interval)
+        return None
+
+    def _fetch_passcode_from_inbox(self, page, cfg: Optional[Dict[str, Any]] = None, timeout_ms: int = 20000) -> Optional[str]:
+        try:
+            inbox_url = os.getenv("EMAIL_INBOX_URL") or (cfg.get("inbox_url") if isinstance(cfg, dict) else None)
+            if not inbox_url:
+                inbox_url = "https://mail.google.com/mail/u/0/#inbox"
+
+            subject_regex = os.getenv("EMAIL_PASSCODE_SUBJECT_REGEX") or (cfg.get("passcode_email_subject_regex") if isinstance(cfg, dict) else None)
+            if not subject_regex:
+                subject_regex = r"(verification code|security code|one-time code|passcode|verification)"
+            code_regex = os.getenv("EMAIL_PASSCODE_REGEX") or (cfg.get("passcode_regex") if isinstance(cfg, dict) else None)
+            if not code_regex:
+                code_regex = r"(\d{4,8})"
+
+            ctx = page.context
+            inbox_page = ctx.new_page()
+            try:
+                inbox_page.goto(inbox_url, timeout=timeout_ms)
+            except Exception:
+                pass
+
+            try:
+                inbox_page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
+            found = False
+            try:
+                found = inbox_page.evaluate(
+                    """(subReStr) => {
+                        try {
+                            const re = new RegExp(subReStr, "i");
+                            const nodes = Array.from(document.querySelectorAll('a,div,span,td,tr'));
+                            for (const n of nodes) {
+                                try {
+                                    const txt = (n.innerText || '').trim();
+                                    if (txt && re.test(txt)) {
+                                        n.scrollIntoView({block:'center', inline:'center'});
+                                        n.click();
+                                        return true;
+                                    }
+                                } catch(e) { continue; }
+                            }
+                            return false;
+                        } catch(e) { return false; }
+                    }""",
+                    subject_regex,
+                )
+            except Exception:
+                found = False
+
+            if not found:
+                try:
+                    content = inbox_page.content()
+                    if re.search(subject_regex, content, re.IGNORECASE):
+                        try:
+                            inbox_page.evaluate(
+                                """(subReStr) => {
+                                    const re = new RegExp(subReStr, "i");
+                                    const nodes = Array.from(document.querySelectorAll('a,div,span,td,tr'));
+                                    for (const n of nodes) {
+                                        try {
+                                            const txt = (n.innerText || '').trim();
+                                            if (txt && re.test(txt)) {
+                                                n.scrollIntoView({block:'center', inline:'center'});
+                                                n.click();
+                                                return true;
+                                            }
+                                        } catch(e) { continue; }
+                                    }
+                                    return false;
+                                }""",
+                                subject_regex,
+                            )
+                            found = True
+                        except Exception:
+                            found = False
+                except Exception:
+                    found = False
+
+            if not found:
+                try:
+                    inbox_page.evaluate(
+                        """() => {
+                            const candidates = document.querySelectorAll('tr, .zA, .message-list-item, .mailListItem, .Row');
+                            if (candidates && candidates.length>0) {
+                                candidates[0].scrollIntoView({block:'center'});
+                                candidates[0].click();
+                                return true;
+                            }
+                            return false;
+                        }"""
+                    )
+                    try:
+                        inbox_page.wait_for_timeout(800)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            try:
+                inbox_page.wait_for_timeout(1200)
+            except Exception:
+                pass
+
+            try:
+                body_text = ""
+                try:
+                    body_text = inbox_page.inner_text("body")[:300000]
+                except Exception:
+                    body_text = inbox_page.content()[:300000]
+                m = re.search(code_regex, body_text)
+                if m:
+                    code = m.group(1)
+                    try:
+                        inbox_page.close()
+                    except Exception:
+                        pass
+                    return code
+            except Exception:
+                pass
+
+            try:
+                html = inbox_page.content()
+                m = re.search(code_regex, html)
+                if m:
+                    code = m.group(1)
+                    try:
+                        inbox_page.close()
+                    except Exception:
+                        pass
+                    return code
+            except Exception:
+                pass
+
+            try:
+                inbox_page.close()
+            except Exception:
+                pass
+            return None
+        except Exception:
+            try:
+                inbox_page.close()
+            except Exception:
+                pass
+            return None
+
+    def _wait_for_login_completion(self, page, cfg: Optional[Dict[str, Any]] = None, timeout_ms: int = POST_PASSCODE_WAIT_MS) -> bool:
+        """
+        Wait for any provider 'open_new_selectors' or other post-login signals to appear.
+        """
+        start = time.time()
+        selectors = []
+        if isinstance(cfg, dict):
+            selectors += cfg.get("open_new_selectors", []) or []
+        # common heuristics
+        selectors += ["button:has-text('Add')", "button:has-text('+ New ticket')", "button:has-text('New')", "a[href*='/agent/tickets/new']", "a:has-text('New Ticket')", "button:has-text('New Ticket')"]
+        while time.time() - start <= (timeout_ms / 1000.0):
+            try:
+                for s in selectors:
+                    try:
+                        if page.query_selector(s):
+                            self._log_step("login_confirmed", {"selector": s})
+                            return True
+                    except Exception:
+                        continue
+                # also check for navigation away from login page
+                try:
+                    url = page.url or ""
+                    if url and not any(x in url for x in ("login", "signin", "verify", "mfa", "auth")):
+                        # best-effort heuristic: assume logged in if URL changed to a non-login page
+                        self._log_step("login_confirmed_by_url", {"url": url})
+                        return True
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_timeout(800)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        self._log_step("login_confirm_timeout", {"timeout_ms": timeout_ms})
+        return False
+
+    # ---------------- LLM-driven DOM inference ----------------
+    def _prepare_base_url(self, cfg: Dict[str, Any]) -> str:
+        base = cfg.get("base_url", "") if isinstance(cfg, dict) else ""
+        try:
+            base = base.format(**os.environ)
+        except Exception:
+            base = base.replace("{ZENDESK_SUBDOMAIN}", os.getenv("ZENDESK_SUBDOMAIN", ""))
+            base = base.replace("{FRESHDESK_DOMAIN}", os.getenv("FRESHDESK_DOMAIN", ""))
+        return base
+
+    def _redact_html_for_llm(self, html: str) -> str:
+        html = _redact_text(html)
+        return html[:120000]
+
+    def _detect_sso_on_page(self, page) -> bool:
+        try:
+            content = ""
+            try:
+                content = page.inner_text("body")[:8000]
+            except Exception:
+                content = page.content()[:8000]
+            for pat in _SSO_BUTTON_PATTERNS:
+                if pat.lower() in content.lower():
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def infer_steps_with_llm(self, page, intent: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            use_mock_dom = os.getenv("USE_MOCK_DOM", "true").strip().lower() not in ("0", "false", "no")
+        except Exception:
+            use_mock_dom = True
+
+        if use_mock_dom:
+            return None
+
+        try:
+            html = page.content()
+            redacted_html = self._redact_html_for_llm(html)
+        except Exception:
+            redacted_html = "<could-not-capture-html>"
+
+        ocr_text = ""
+        try:
+            if os.getenv("UI_AGENT_USE_OCR", "false").strip().lower() in ("1", "true", "yes"):
+                ocr_text = self._screenshot_to_text(page)
+        except Exception:
+            ocr_text = ""
+
+        instruction = intent.get("meta", {}).get("instruction", "") or intent.get("subject", "")
+        prompt = (
+            "Produce a single JSON object containing 'fields' and 'steps' for executing the instruction on the given page.\n"
+            "fields: map of logical field name -> {value, selector_candidates}.\n"
+            "steps: ordered list of actions with 'action'(click|fill), selector_candidates (list), and 'value_source' if needed.\n\n"
+            "Page HTML (redacted):\n"
+            + redacted_html[:60000]
+            + "\n\nOCR text (if any):\n"
+            + (ocr_text[:20000] if ocr_text else "")
+            + "\n\nUser instruction:\n"
+            + instruction
+            + "\n\nReturn only JSON with keys 'fields' and/or 'steps'."
+        )
+
+        try:
+            resp = parser_mod.call_groq(prompt, timeout=60)
+            parsed = parser_mod.extract_json_from_response(resp)
+            if isinstance(parsed, dict):
+                steps = parsed.get("steps")
+                fields = parsed.get("fields")
+                result = {}
+                if steps:
+                    result["steps"] = steps
+                if fields:
+                    result["fields"] = fields
+                if result:
+                    return result
+            return None
+        except Exception:
+            logger.debug("LLM-based inference failed", exc_info=True)
+            return None
+
+    def _attempt_login(self, page, provider: str, cfg: Dict[str, Any], timeout: int = 15000) -> bool:
+        try:
+            login_cfg = cfg.get("login") if isinstance(cfg, dict) else None
+            if not login_cfg:
+                return False
+
+            provider = provider.lower()
+            if provider == "zendesk":
+                email = os.getenv("ZENDESK_EMAIL")
+                pwd = os.getenv("ZENDESK_PASSWORD") or os.getenv("ZENDESK_API_TOKEN")
+            elif provider == "freshdesk":
+                email = os.getenv("FRESHDESK_EMAIL")
+                pwd = os.getenv("FRESHDESK_PASSWORD") or os.getenv("FRESHDESK_API_KEY")
+            else:
+                email = os.getenv(f"{provider.upper()}_EMAIL")
+                pwd = os.getenv(f"{provider.upper()}_PASSWORD")
+
+            if not email or not pwd:
+                return False
+
+            for sel in login_cfg.get("email_selectors", []):
+                try:
+                    page.wait_for_selector(sel, timeout=2000)
+                    page.fill(sel, email)
+                    self._log_step("login_fill_email", {"selector": sel})
+                    break
+                except Exception:
+                    continue
+
+            for sel in login_cfg.get("password_selectors", []):
+                try:
+                    page.wait_for_selector(sel, timeout=2000)
+                    page.fill(sel, pwd)
+                    self._log_step("login_fill_password", {"selector": sel})
+                    break
+                except Exception:
+                    continue
+
+            for sel in login_cfg.get("login_button_selectors", []):
+                try:
+                    page.click(sel)
+                    self._log_step("login_click", {"selector": sel})
+                    try:
+                        page.wait_for_load_state(timeout=timeout)
+                    except Exception:
+                        pass
+
+                    try:
+                        # small sleep to allow OTP / passcode UI to render
+                        try:
+                            page.wait_for_timeout(800)
+                        except Exception:
+                            pass
+
+                        # If a passcode prompt appears, attempt to resolve it
+                        if self._detect_passcode_prompt(page, cfg):
+                            self._log_step("passcode_prompt_detected", {"provider": provider})
+
+                            # Try IMAP first (recommended)
+                            self._log_step("passcode_fetch_attempted", {"method": "imap"})
+                            passcode = self._fetch_passcode_via_imap(cfg=cfg, timeout_seconds=int(os.getenv("EMAIL_IMAP_POLL_TIMEOUT_S", "30")), poll_interval=float(os.getenv("EMAIL_IMAP_POLL_INTERVAL_S", "3.0")))
+                            if passcode:
+                                self._log_step("passcode_fetched_imap", {"provider": provider})
+                            else:
+                                # fallback to browser-inbox scraping
+                                self._log_step("passcode_fetch_attempted", {"method": "inbox"})
+                                passcode = self._fetch_passcode_from_inbox(page, cfg)
+                                if passcode:
+                                    self._log_step("passcode_fetched_inbox", {"provider": provider})
+
+                            if passcode:
+                                pass_selectors = (cfg.get("passcode_selectors") or []) if isinstance(cfg, dict) else []
+                                if not pass_selectors:
+                                    pass_selectors = ["input[name='otp']", "input[type='tel']", "input[name*='code']", "input[id*='code']"]
+                                filled = False
+                                for ps in pass_selectors:
+                                    try:
+                                        if page.query_selector(ps):
+                                            page.fill(ps, passcode)
+                                            try:
+                                                page.dispatch_event(ps, "input", {"data": passcode})
+                                            except Exception:
+                                                pass
+                                            try:
+                                                page.dispatch_event(ps, "change")
+                                            except Exception:
+                                                pass
+                                            filled = True
+                                            self._log_step("passcode_filled", {"selector": ps})
+                                            break
+                                    except Exception:
+                                        continue
+                                verify_selectors = (cfg.get("passcode_submit_selectors") or []) if isinstance(cfg, dict) else []
+                                verify_selectors += ["button:has-text('Verify')", "button:has-text('Continue')", "button:has-text('Submit')", "button[type='submit']"]
+                                for vs in verify_selectors:
+                                    try:
+                                        if page.query_selector(vs):
+                                            try:
+                                                page.click(vs)
+                                                self._log_step("passcode_submit_clicked", {"selector": vs})
+                                            except Exception:
+                                                try:
+                                                    page.eval_on_selector(vs, "el => el.click()")
+                                                    self._log_step("passcode_submit_js_click", {"selector": vs})
+                                                except Exception:
+                                                    pass
+                                            break
+                                    except Exception:
+                                        continue
+                                try:
+                                    page.wait_for_timeout(1200)
+                                except Exception:
+                                    pass
+
+                                # wait for post-login UI
+                                logged = self._wait_for_login_completion(page, cfg, timeout_ms=POST_PASSCODE_WAIT_MS)
+                                if logged:
+                                    return True
+                                else:
+                                    self._log_step("login_not_confirmed_after_passcode", {"provider": provider})
+                                    return False
+                            else:
+                                self._log_step("passcode_fetch_failed", {"provider": provider})
+                                return False
+                        else:
+                            # No passcode prompt detected; wait for login completion heuristics
+                            logged = self._wait_for_login_completion(page, cfg, timeout_ms=POST_PASSCODE_WAIT_MS)
+                            return logged
+                    except Exception:
+                        logger.debug("Exception while handling passcode: %s", traceback.format_exc())
+                        return False
+                except Exception:
+                    continue
+
+            return False
+        except Exception:
+            logger.debug("Exception in _attempt_login: %s", traceback.format_exc())
+            return False
+
+    def _resolve_adapter(self, provider: str, cfg: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+        try:
+            if isinstance(cfg, dict) and cfg.get("adapter"):
+                adapter = get_adapter(cfg.get("adapter"))
+                if adapter:
+                    return adapter
+                adapter = get_adapter(str(cfg.get("adapter")).split(".")[-1])
+                if adapter:
+                    return adapter
+        except Exception:
+            pass
+        try:
+            return get_adapter(provider)
+        except Exception:
+            return None
 
     def execute_steps(self, page, steps: List[Dict[str, Any]], intent: Dict[str, Any], per_step_retries: int = 2) -> bool:
         try:
@@ -377,339 +1019,153 @@ class GenericUIAgent:
             logger.debug("Exception executing DOM steps: %s", traceback.format_exc())
             return False
 
-    # --------- LLM-driven DOM inference (when no steps provided) -----------
-    def _prepare_base_url(self, cfg: Dict[str, Any]) -> str:
-        base = cfg.get("base_url", "")
-        # fill placeholders from env
-        try:
-            base = base.format(**os.environ)
-        except Exception:
-            # try manual replacements for common keys
-            base = base.replace("{ZENDESK_SUBDOMAIN}", os.getenv("ZENDESK_SUBDOMAIN", ""))
-            base = base.replace("{FRESHDESK_DOMAIN}", os.getenv("FRESHDESK_DOMAIN", ""))
-        return base
-
-    def _redact_html_for_llm(self, html: str) -> str:
-        html = _redact_text(html)
-        # keep a reasonable snippet size
-        return html[:120000]
-
-    def infer_steps_with_llm(self, page, intent: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Capture page HTML (redacted), and ask the LLM (via parser.call_groq + extract_json_from_response)
-        to produce the same DOM steps JSON format used by execute_steps.
-        Returns parsed dict or None on failure.
-        """
-        try:
-            try:
-                dom_html = page.content()
-            except Exception:
-                dom_html = "<could-not-capture-dom/>"
-            dom_html = self._redact_html_for_llm(dom_html)
-
-            instruction = intent.get("meta", {}).get("instruction") or intent.get("instruction") or "<no instruction provided>"
-
-            # Example JSON structure as Python dict, then serialized safely with json.dumps
-            example_struct = {
-                "fields": {
-                    "subject": {
-                        "value": "...",
-                        "selector_candidates": ["input[placeholder='Subject']"]
-                    }
-                },
-                "steps": [
-                    {"action": "click", "selector_candidates": ["button:has-text('New')"]},
-                    {"action": "fill", "target": "subject", "selector_candidates": ["input[placeholder='Subject']"], "value_source": "fields.subject.value"}
-                ]
-            }
-
-            # Build prompt safely using a triple-quoted f-string and json.dumps for the example
-            prompt = f"""You are a UI assistant that outputs JSON describing form fields and DOM interaction steps
-for filling a ticket form in a web app. Only output valid JSON. Keys: fields (mapping logical names -> {{value, selector_candidates}})
-and steps (ordered list of {{action:'click'|'fill', selector_candidates:[...], target|'value_source' ...}}).
-
-INSTRUCTION:
-{instruction}
-
-PAGE_HTML_SNIPPET (redacted):
-{dom_html}
-
-Return compact JSON. Example structure:
-{json.dumps(example_struct)}
-"""
-
-            # Call the LLM via the existing parser wrapper and extract JSON safely
-            try:
-                resp = parser_mod.call_groq(prompt, timeout=30)
-                parsed = parser_mod.extract_json_from_response(resp)
-                if not isinstance(parsed, dict):
-                    return None
-                if "steps" in parsed or "fields" in parsed:
-                    return parsed
-                return None
-            except Exception:
-                logger.debug("LLM inference call or parsing failed", exc_info=True)
-                return None
-
-        except Exception:
-            logger.debug("infer_steps_with_llm encountered an unexpected error", exc_info=True)
-            return None
-
-    # ------------ unified, config-driven create_ticket -------------------
-    def create_ticket(self, provider: str, intent: Dict[str, Any], dry_run: bool = False, headless: Optional[bool] = None, slow_mo: Optional[int] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
-        provider = provider.lower()
-        cfg = self.provider_configs.get(provider)
-        if not cfg:
-            return {"status": "error", "error": f"no config for provider: {provider}"}
+    def create_ticket(self, provider: str, intent: Dict[str, Any], dry_run: bool = False, timeout: Optional[int] = None, headless: Optional[bool] = None, slow_mo: Optional[int] = None, user_data_dir: Optional[str] = None) -> Dict[str, Any]:
+        self._run_id = uuid.uuid4().hex
+        provider = (provider or "").lower()
+        cfg = self.provider_configs.get(provider, {}) if isinstance(self.provider_configs, dict) else {}
+        base_url = self._prepare_base_url(cfg)
         timeout = timeout or DEFAULT_TIMEOUT
 
-        base_url = self._prepare_base_url(cfg)
-        result: Dict[str, Any] = {"status": "error", "error": None, "url": None, "ticket_id": None, "api_result": None}
+        def _result(status: str, detail: Optional[Dict[str, Any]] = None):
+            out = {"status": status, "run_id": self._run_id}
+            if detail:
+                out.update(detail)
+            return out
 
-        # new run
-        self._run_id = str(uuid.uuid4())
-        self._log_step("run_start", {"provider": provider, "intent_summary": _redact_obj({"subject": intent.get("subject"), "requester": intent.get("requester")})})
-
-        agent = GenericUIAgent(headless=headless if headless is not None else self.headless, slow_mo=slow_mo if slow_mo is not None else self.slow_mo, user_data_dir=self.user_data_dir)
+        if dry_run:
+            steps = intent.get("steps") or []
+            return _result("dry-run", {"steps": steps})
 
         try:
             with sync_playwright() as p:
-                ctx_or_browser, page, persistent = agent._launch(p)
+                ctx_or_browser, page, is_persistent = self._launch(p)
+
                 try:
                     if base_url:
                         try:
-                            page.goto(base_url, wait_until="load", timeout=timeout)
+                            page.goto(base_url, timeout=timeout)
                         except Exception:
-                            try:
-                                page.goto(base_url, wait_until="domcontentloaded", timeout=timeout)
-                            except Exception:
-                                pass
+                            logger.debug("Navigation to base_url failed; continuing", exc_info=True)
 
-                    # Generic login attempt using configured selectors
-                    login_cfg = cfg.get("login", {})
-                    email_selectors = login_cfg.get("email_selectors", [])
-                    password_selectors = login_cfg.get("password_selectors", [])
-                    login_button_selectors = login_cfg.get("login_button_selectors", [])
-                    email = os.getenv(f"{provider.upper()}_EMAIL") or os.getenv("ZENDESK_EMAIL") or os.getenv("FRESHDESK_EMAIL")
-                    password = os.getenv(f"{provider.upper()}_PASSWORD") or os.getenv("ZENDESK_PASSWORD") or os.getenv("FRESHDESK_PASSWORD")
                     try:
-                        if email_selectors:
-                            page.wait_for_selector(", ".join(email_selectors), timeout=SHORT_TIMEOUT)
-                            logger.info("Login UI detected for %s; attempting generic credential fill", provider)
-                            if email and agent.safe_fill(page, email_selectors, email, timeout=SHORT_TIMEOUT)[0]:
-                                if password and password_selectors:
-                                    agent.safe_fill(page, password_selectors, password, timeout=SHORT_TIMEOUT)
-                                if login_button_selectors:
-                                    agent.safe_click(page, login_button_selectors, timeout=SHORT_TIMEOUT)
-                                page.wait_for_load_state("load", timeout=timeout)
-                            else:
-                                logger.info("Detected login area but could not auto-fill credentials for %s", provider)
-                    except PlaywrightTimeoutError:
-                        logger.debug("No immediate login found for %s (may be SSO or already logged in)", provider)
-
-                    # If intent already has steps, prefer them
-                    if intent.get("steps"):
-                        if dry_run:
-                            return {"status": "dry-run", "steps": intent.get("steps")}
-                        ok = agent.execute_steps(page, intent.get("steps", []), intent)
-                        time.sleep(1.0)
-                        result_url = page.url
-                        if ok:
-                            result.update({"status": "ok", "url": result_url, "message": "Executed provided DOM steps; verify UI."})
-                            try:
-                                m = re.search(r"/tickets/(\d+)", result_url)
-                                if m:
-                                    result["ticket_id"] = int(m.group(1))
-                            except Exception:
-                                pass
-                            try:
-                                agent.save_diagnostic(page, f"{provider}_steps_executed")
-                            except Exception:
-                                pass
-                            return result
-                        logger.info("Provided DOM steps failed or incomplete; falling back to inference/heuristics")
-
-                    # Attempt to infer steps using LLM from the live DOM (high-impact)
-                    inferred = None
-                    try:
-                        inferred = self.infer_steps_with_llm(page, intent)
-                    except Exception:
-                        inferred = None
-
-                    if inferred and isinstance(inferred, dict) and inferred.get("steps"):
-                        # attach and execute inferred steps
-                        intent.setdefault("fields", {}).update(inferred.get("fields", {}))
-                        intent["steps"] = inferred["steps"]
-                        self._log_step("inferred_steps_attached", {"count": len(inferred["steps"])})
-                        if dry_run:
-                            return {"status": "dry-run", "steps": intent.get("steps")}
-                        ok = agent.execute_steps(page, intent.get("steps", []), intent)
-                        time.sleep(1.0)
-                        result_url = page.url
-                        if ok:
-                            result.update({"status": "ok", "url": result_url, "message": "Executed LLM-inferred DOM steps; verify UI."})
-                            try:
-                                m = re.search(r"/tickets/(\d+)", result_url)
-                                if m:
-                                    result["ticket_id"] = int(m.group(1))
-                            except Exception:
-                                pass
-                            try:
-                                agent.save_diagnostic(page, f"{provider}_inferred_steps_executed")
-                            except Exception:
-                                pass
-                            return result
-                        logger.info("LLM-inferred steps execution failed; falling back to config-driven heuristics")
-
-                    # --- Config-driven heuristic flow: open 'new' and fill fields ---
-                    opened = False
-                    for s in cfg.get("open_new_selectors", []):
-                        opened, _ = agent.safe_click(page, s, timeout=SHORT_TIMEOUT)
-                        if opened:
-                            break
-                    if not opened:
-                        try:
-                            if provider == "zendesk":
-                                page.goto(f"https://{os.getenv('ZENDESK_SUBDOMAIN','')}.zendesk.com/agent/tickets/new", wait_until="load", timeout=timeout)
-                            elif provider == "freshdesk":
-                                page.goto(f"https://{os.getenv('FRESHDESK_DOMAIN','')}.freshdesk.com/a/tickets/new", wait_until="load", timeout=timeout)
-                        except Exception:
-                            logger.debug("direct new ticket path failed", exc_info=True)
-
-                    fields_cfg = cfg.get("fields", {})
-                    subject = intent.get("subject", "")
-                    if "subject" in fields_cfg:
-                        ok, used = agent.safe_fill(page, fields_cfg["subject"], subject, timeout=SHORT_TIMEOUT)
-                        if not ok:
-                            lbl = agent.find_field_by_label(page, "subject")
-                            if lbl:
-                                agent.safe_fill(page, lbl, subject, timeout=SHORT_TIMEOUT)
-
-                    requester_email = intent.get("requester", {}).get("email") if isinstance(intent.get("requester"), dict) else (intent.get("requester") or "")
-                    if "requester" in fields_cfg and requester_email:
-                        ok, used = agent.safe_fill(page, fields_cfg["requester"], requester_email, timeout=SHORT_TIMEOUT)
-                        if not ok:
-                            lbl = agent.find_field_by_label(page, "requester")
-                            if lbl:
-                                agent.safe_fill(page, lbl, requester_email, timeout=SHORT_TIMEOUT)
-                        try:
-                            page.wait_for_selector("div[role='option'], li[role='option'], .ember-power-select-option", timeout=SHORT_TIMEOUT)
-                            agent.safe_click(page, ["div[role='option']", "li[role='option']", ".ember-power-select-option"], timeout=SHORT_TIMEOUT)
-                        except PlaywrightTimeoutError:
-                            pass
-
-                    description = intent.get("description", "") or ""
-                    if "description" in fields_cfg:
-                        ok, used = agent.safe_fill(page, fields_cfg["description"], description, timeout=SHORT_TIMEOUT)
-                        if not ok:
-                            lbl = agent.find_field_by_label(page, "description")
-                            if lbl:
-                                agent.safe_fill(page, lbl, description, timeout=SHORT_TIMEOUT)
-                        try:
-                            for f in page.frames:
+                        if cfg and cfg.get("login"):
+                            sso_detected = self._detect_sso_on_page(page)
+                            if sso_detected and not is_persistent:
+                                wait_ms = SSO_MANUAL_WAIT_MS
+                                self._log_step("sso_detected", {"provider": provider, "wait_ms": wait_ms})
                                 try:
-                                    f.wait_for_selector("body", timeout=SHORT_TIMEOUT)
+                                    page.wait_for_timeout(wait_ms)
+                                except Exception:
+                                    pass
+                                logged_in = False
+                                for sel in (cfg.get("open_new_selectors") or [])[:3]:
                                     try:
-                                        f.fill("body", description)
-                                        break
+                                        if page.query_selector(sel):
+                                            logged_in = True
+                                            break
                                     except Exception:
                                         continue
-                                except PlaywrightTimeoutError:
-                                    continue
-                        except Exception:
-                            logger.debug("iframe handling error", exc_info=True)
+                                if not logged_in:
+                                    self._log_step("sso_manual_timeout", {"provider": provider})
+                                    adapter = self._resolve_adapter(provider, cfg)
+                                    if adapter:
+                                        try:
+                                            adapter_res = adapter.create_ticket(intent)
+                                            if not _DEBUG_RETURN_RAW and isinstance(adapter_res, dict) and "raw" in adapter_res:
+                                                adapter_res.pop("raw", None)
+                                            return {provider: adapter_res}
+                                        except Exception:
+                                            logger.debug("Adapter fallback failed for provider %s: %s", provider, traceback.format_exc())
+                                            return {provider: {"status": "error", "error": "adapter fallback failed"}}
+                                    else:
+                                        return _result("error", {"error": f"SSO required and no adapter for provider {provider}"})
+                            else:
+                                did_login = self._attempt_login(page, provider, cfg, timeout=8000)
+                                if did_login:
+                                    self._log_step("login_attempted", {"provider": provider})
+                                else:
+                                    # login failed or not confirmed; attempt adapter fallback
+                                    self._log_step("login_failed_or_not_confirmed", {"provider": provider})
+                                    adapter = self._resolve_adapter(provider, cfg)
+                                    if adapter:
+                                        try:
+                                            adapter_res = adapter.create_ticket(intent)
+                                            if not _DEBUG_RETURN_RAW and isinstance(adapter_res, dict) and "raw" in adapter_res:
+                                                adapter_res.pop("raw", None)
+                                            return {provider: adapter_res}
+                                        except Exception:
+                                            logger.debug("Adapter fallback failed for provider %s: %s", provider, traceback.format_exc())
+                                            return {provider: {"status": "error", "error": "adapter fallback failed"}}
+                                    else:
+                                        return _result("error", {"error": f"login failed and no adapter for provider {provider}"})
+                    except Exception:
+                        logger.debug("Login attempt encountered an exception", exc_info=True)
 
-                    tags = intent.get("tags", []) or []
-                    if tags and "tags" in fields_cfg:
-                        for t in tags:
-                            ok, used = agent.safe_fill(page, fields_cfg["tags"], t, timeout=SHORT_TIMEOUT)
-                            if ok:
-                                agent.safe_click(page, ["button:has-text('+ Add Tag')", "button:has-text('Add tag')"], timeout=SHORT_TIMEOUT)
+                    steps = intent.get("steps")
+                    if not steps:
+                        inferred = self.infer_steps_with_llm(page, intent)
+                        if inferred:
+                            steps = inferred.get("steps", [])
+                            if inferred.get("fields"):
+                                intent.setdefault("fields", {}).update(inferred.get("fields", {}))
 
-                    if "type" in fields_cfg and intent.get("type"):
-                        try:
-                            page.select_option("select[name='type']", label=intent.get("type"))
-                        except Exception:
-                            agent.safe_click(page, [f"button:has-text('{intent.get('type')}')", f"div:has-text('{intent.get('type')}')"], timeout=SHORT_TIMEOUT)
-                    if "priority" in fields_cfg and intent.get("priority"):
-                        try:
-                            page.select_option("select[name='priority']", label=intent.get("priority"))
-                        except Exception:
-                            agent.safe_click(page, [f"button:has-text('{intent.get('priority')}')", f"div:has-text('{intent.get('priority')}')"], timeout=SHORT_TIMEOUT)
-
-                    _subject_val = (subject or "").strip()
-                    _description_val = (description or "").strip()
-                    if not _subject_val or not _description_val:
-                        missing = []
-                        if not _subject_val: missing.append("subject")
-                        if not _description_val: missing.append("description")
-                        logger.warning("Missing required fields after UI fill: %s", missing)
-                        try:
-                            agent.save_diagnostic(page, f"{provider}_missing_fields")
-                        except Exception:
-                            pass
-                        if provider == "zendesk":
-                            api_res = zendesk_adapter.create_ticket(intent)
+                    if not steps:
+                        logger.warning("No UI steps available for provider %s; falling back to API adapter", provider)
+                        adapter = self._resolve_adapter(provider, cfg)
+                        if adapter:
+                            try:
+                                adapter_res = adapter.create_ticket(intent)
+                                if not _DEBUG_RETURN_RAW and isinstance(adapter_res, dict) and "raw" in adapter_res:
+                                    adapter_res.pop("raw", None)
+                                return {provider: adapter_res}
+                            except Exception:
+                                logger.debug("Adapter fallback failed for provider %s: %s", provider, traceback.format_exc())
+                                return {provider: {"status": "error", "error": "adapter fallback failed"}}
                         else:
-                            api_res = freshdesk_adapter.create_ticket(intent)
-                        result["api_result"] = api_res
-                        if api_res.get("status") == "ok":
-                            result.update({"status": "ok", "ticket_id": api_res.get("ticket_id"), "url": api_res.get("raw", {}).get("url")})
-                        else:
-                            result.update({"status": "error", "error": "Missing required fields and API fallback failed", "missing": missing, "api_result": api_res})
-                        return result
+                            return _result("error", {"error": f"no steps and no adapter for provider {provider}"})
 
-                    submitted = False
-                    for s in cfg.get("submit_selectors", []):
-                        submitted, used = agent.safe_click(page, s, timeout=SHORT_TIMEOUT)
-                        if submitted:
-                            break
-                    if not submitted:
-                        try:
-                            page.keyboard.press("Enter")
-                        except Exception:
-                            pass
+                    ok = self.execute_steps(page, steps, intent)
 
-                    time.sleep(1.2)
-                    result_url = page.url
-                    if any(x in result_url.lower() for x in ("/support/login", "/sso", "/login", "accounts.google.com", "microsoftonline.com")):
-                        logger.info("Detected login/SSO or external auth after submit; attempting API fallback")
-                        try:
-                            agent.save_diagnostic(page, f"{provider}_sso")
-                        except Exception:
-                            pass
-                        if provider == "zendesk":
-                            api_res = zendesk_adapter.create_ticket(intent)
-                        else:
-                            api_res = freshdesk_adapter.create_ticket(intent)
-                        result["api_result"] = api_res
-                        if api_res.get("status") == "ok":
-                            result.update({"status": "ok", "ticket_id": api_res.get("ticket_id"), "url": api_res.get("raw", {}).get("url"), "message": "Created via API fallback"})
-                            return result
-                        else:
-                            result.update({"status": "error", "error": "UI failed and API fallback failed", "url": result_url})
-                            return result
+                    try:
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        pass
 
-                    result.update({"status": "ok", "url": result_url, "message": "Attempted UI ticket creation; verify UI."})
-                    return result
+                    try:
+                        submit_ok, submit_used = self._attempt_submit(page, cfg)
+                        if submit_ok:
+                            ok = True
+                            self._log_step("submit_fallback_success", {"selector_used": submit_used})
+                    except Exception:
+                        logger.debug("submit fallback failed", exc_info=True)
 
+                    try:
+                        self.save_diagnostic(page, provider)
+                    except Exception:
+                        logger.debug("save_diagnostic_failed", exc_info=True)
+                    try:
+                        _save_selector_stats(self.selector_stats)
+                    except Exception:
+                        logger.debug("saving selector stats failed", exc_info=True)
+
+                    return _result("ok" if ok else "failed", {"executed_steps": len(steps)})
                 finally:
-                    agent._close(ctx_or_browser)
-        except PlaywrightTimeoutError as te:
-            logger.exception("Timeout while creating ticket for %s: %s", provider, te)
-            if provider == "zendesk":
-                api_try = zendesk_adapter.create_ticket(intent)
-            else:
-                api_try = freshdesk_adapter.create_ticket(intent)
-            if api_try.get("status") == "ok":
-                return {"status": "ok", "ticket_id": api_try.get("ticket_id"), "url": api_try.get("raw", {}).get("url"), "message": "Timeout in UI; created via API fallback", "api_result": api_try}
-            return {"status": "error", "error": "Timeout while interacting with UI: " + str(te), "api_result": api_try}
-        except Exception as e:
-            logger.exception("Unhandled error in create_ticket for %s: %s", provider, e)
-            if provider == "zendesk":
-                api_try = zendesk_adapter.create_ticket(intent)
-            else:
-                api_try = freshdesk_adapter.create_ticket(intent)
-            if api_try.get("status") == "ok":
-                return {"status": "ok", "ticket_id": api_try.get("ticket_id"), "url": api_try.get("raw", {}).get("url"), "message": "UI raised error; created via API fallback", "api_result": api_try}
-            return {"status": "error", "error": str(e), "api_result": api_try}
+                    try:
+                        self._close(ctx_or_browser)
+                    except Exception:
+                        logger.debug("Error during browser close", exc_info=True)
+        except Exception:
+            logger.exception("Unhandled exception in create_ticket")
+            try:
+                adapter = self._resolve_adapter(provider, cfg)
+                if adapter:
+                    try:
+                        adapter_res = adapter.create_ticket(intent)
+                        if not _DEBUG_RETURN_RAW and isinstance(adapter_res, dict) and "raw" in adapter_res:
+                            adapter_res.pop("raw", None)
+                        return {provider: adapter_res}
+                    except Exception:
+                        logger.debug("adapter fallback also failed", exc_info=True)
+            except Exception:
+                logger.debug("adapter fallback also failed", exc_info=True)
+            return {"status": "error", "error": "unhandled exception during UI run"}
