@@ -6,11 +6,10 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# reuse your package session if you have adapters.session
 try:
     from .session import session, DEFAULT_REQUEST_TIMEOUT, DEBUG_RETURN_RAW
 except Exception:
-    # fallback if not present (keeps original simple shape)
+    # fallback if not present
     session = requests
     DEFAULT_REQUEST_TIMEOUT = int(os.getenv("ADAPTER_REQUEST_TIMEOUT_S", "30"))
     DEBUG_RETURN_RAW = False
@@ -44,10 +43,9 @@ class FreshdeskAdapter:
 
         timeout = timeout or DEFAULT_REQUEST_TIMEOUT
         url = f"https://{self.domain}.freshdesk.com/api/v2/tickets"
-        auth = (self.api_key, "X")  # Freshdesk uses API key as username and any password
+        auth = (self.api_key, "X")  
 
-        # include a default status (2 is commonly 'Open' in Freshdesk) to satisfy instances
-        # that enforce status in ticket creation. You can override by passing payload["status"].
+        # include a default status (2 is 'Open' in Freshdesk) to satisfy instances
         data = {
             "subject": payload.get("subject"),
             "description": payload.get("description", ""),
