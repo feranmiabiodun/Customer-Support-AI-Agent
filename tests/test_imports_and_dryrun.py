@@ -1,11 +1,14 @@
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import pytest
 
 def test_imports():
-    import parser  # noqa: F401
-    from agents import generic_ui_agent  # noqa: F401
-    import agents.ui_agent  # noqa: F401
-    import adapters  # noqa: F401
-    import llm.mock_dom_steps  # noqa: F401
+    import parser  
+    from agents import ui_agent  
+    import agents.compat_ui_shim  
+    import adapters  
+    import llm.mock_dom_steps 
 
 def test_run_create_ticket_dry_run(monkeypatch):
     import run_create_ticket
@@ -31,8 +34,8 @@ def test_run_create_ticket_dry_run(monkeypatch):
     assert isinstance(results["zendesk"]["steps"], list)
 
 def test_generic_agent_dry_run():
-    from agents.generic_ui_agent import GenericUIAgent
-    agent = GenericUIAgent()
+    from agents.ui_agent import CoreAgent
+    agent = CoreAgent()
     intent = {
         "subject": "s",
         "description": "d",

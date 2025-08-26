@@ -7,16 +7,19 @@ Fallback: API mode if explicitly requested.
 
 Usage:
   python run_create_ticket.py "Create a high priority ticket about login issues for bob@example.com"
-  python run_create_ticket.py "Create a medium priority ticket about API 500 errors for alice@example.com" ui
-  python run_create_ticket.py "Create a low priority ticket about password reset issues for alice@example.com" api
-  python run_create_ticket.py "Create a low priority ticket about password reset issues for alice@example.com" ui dry-run
+  python run_create_ticket.py "Create a medium priority ticket about API 500 errors for bob@example.com" ui
+  python run_create_ticket.py "Create a low priority ticket about password reset issues for bob@example.com" api
+  python run_create_ticket.py "Create a low priority ticket about password reset issues for bob@example.com" ui dry-run
 """
 import sys
 import json
 import re
 from parser import parse_instruction
 from adapters import zendesk_adapter, freshdesk_adapter
-from agents import ui_agent
+from agents import compat_ui_shim
+
+from dotenv import load_dotenv
+load_dotenv()
 
 _EMAIL_RE = re.compile(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})")
 
@@ -46,8 +49,8 @@ def dispatch(parsed_json, mode="ui", dry_run: bool = False):
 
         elif mode == "ui":
             try:
-                # ui_agent shim expects (intent, provider, dry_run=...)
-                results[pname] = ui_agent.create_ticket(parsed_json, pname, dry_run=dry_run)
+                # compat_ui_shim expects (intent, provider, dry_run=...)
+                results[pname] = compat_ui_shim.create_ticket(parsed_json, pname, dry_run=dry_run)
             except Exception as e:
                 results[pname] = {"status": "error", "error": str(e)}
         else:

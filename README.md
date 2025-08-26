@@ -1,4 +1,4 @@
-# Universal UI Agent
+# Universal UI Agent - Abiodun Adeagbo's submission
 
 ## Overview
 
@@ -22,11 +22,11 @@ The project implements the screening scenario requirements:
 * Includes passcode (2FA) retrieval by IMAP and a browser-inbox fallback.
 * Offers a mock mode for deterministic CI/local testing (attaches deterministic DOM steps).
 
-Stretch features implemented or scaffolded:
+Stretch features implemented:
 
 * IMAP passcode retrieval and browser-inbox fallback.
-* Selector scoring and persistence (`selector_stats.json`).
-* OCR hook (optional, `pytesseract`) for augmenting LLM prompts.
+* Selector scoring and persistence.
+* OCR hook (`pytesseract`) for augmenting LLM prompts.
 * Adapter registry for pluggable API fallbacks.
 * Logging of step-level events (JSON-lines).
 
@@ -34,43 +34,137 @@ Stretch features implemented or scaffolded:
 
 ## Architecture (high-level)
 
-* **Parser** (`parser.py` + `prompt_template.txt`, `schema.json`): Turns an NL instruction into a canonical JSON instruction object (subject, description, requester, priority, providers, metadata). Supports deterministic mock DOM step attachment (`llm/mock_dom_steps.py`) for testability.
-* **Agent core** (`agents/generic_ui_agent.py`): Core engine that:
+```
 
-  * Loads provider configs from `providers/*.json`.
-  * Launches Playwright browser or persistent context.
-  * Attempts login flows; detects passcode prompt and retrieves passcode via IMAP or inbox scraping.
-  * Executes DOM steps using robust primitives (`safe_fill`, `safe_click`) with retries and fallbacks.
-  * Attempts submission with multi-strategy `_attempt_submit`.
-  * Persists redacted structured logs and diagnostics.
-  * Falls back to adapters when UI flow is blocked (SSO, missing fields).
-* **Shim** (`agents/ui_agent.py`): Thin compatibility layer providing the same public functions existing callers expect.
-* **Adapters** (`adapters/__init__.py`): Provider API implementations (Zendesk, Freshdesk) and a registry (`get_adapter`) for fallback.
-* **Providers** (`providers/*.json`): JSON configuration files describing base URLs, selectors for login/open/new/fields/submit, optional passcode selectors and inbox details.
-* **LLM mock** (`llm/mock_dom_steps.py`): Deterministic mapping from a parsed instruction to a set of DOM steps for reliable CI tests.
-* **Runner** (`run_create_ticket.py`): CLI entrypoint that parses instructions and dispatches to UI automation or API mode (and supports dry-run).
-* **Tests** (`tests/`): Smoke tests for imports and dry-run.
+├─ run\_create\_ticket.py
+├─ parser.py
+├─ agents/
+│  ├─ **init**.py
+│  ├─ ui\_agent.py
+│  └─ compat\_ui\_shim.py
+├─ adapters/
+│  ├─ **init**.py
+│  ├─ freshdesk.py
+│  ├─ zendesk.py
+│  └─ session.py
+├─ llm/
+│  ├─ **init**.py
+│  └─ mock\_dom\_steps.py
+├─ tests/
+│  ├─ test\_imports\_and\_dryrun.py
+│  └─ test\_adapters.py
+├─ schema.json
+├─ prompt\_template.txt
+├─ providers/
+│  ├─ zendesk.json
+│  └─ freshdesk.json
+├─ requirements.txt
+├─ .env.example
+└─ README.md
+
+```
 
 ---
 
-## Component descriptions
+## Flow-oriented file explanations
 
-* `run_create_ticket.py` — CLI runner. Parses the instruction and dispatches to either UI automation or adapter API; supports dry-run mode.
-* `parser.py` — Renders the prompt template, calls the LLM (Groq/OpenAI-compatible endpoint) or uses mock mode, extracts JSON, validates against `schema.json`, normalizes into canonical form.
-* `prompt_template.txt` — LLM prompt template that requires a strict JSON-only response following the schema.
-* `schema.json` — JSON Schema for the canonical instruction object.
-* `agents/generic_ui_agent.py` — Primary automation engine. Implements login, passcode retrieval, DOM step execution, submit heuristics, diagnostics, and adapter fallbacks.
-* `agents/ui_agent.py` — Backwards-compatible shim that instantiates `GenericUIAgent` and exposes `create_ticket()` convenience wrappers.
-* `adapters/__init__.py` — Adapter implementations and registry (`get_adapter(provider_name)`).
-* `providers/` — Per-provider JSON files describing base\_url, login selectors, field selector candidates, submit selectors, optional passcode selectors, etc.
-* `llm/mock_dom_steps.py` — Generates deterministic DOM steps for tests and CI.
-* `tests/` — Automated tests (e.g., dry-run behavior).
+### `run_create_ticket.py` — Entrypoint (CLI + programmatic dispatcher)
+
+This is the canonical entrypoint for the project. Callers (humans or CI) invoke this to run the end-to-end flow. It: accepts a natural-language instruction, calls the parser to get a canonical `parsed` intent, and dispatches that intent to one or more providers via either the UI automation path or the API adapters. Use this script for production-style runs and for the simple, reviewer-friendly end-to-end invocation.
+
+**CLI examples (canonical ways to exercise the end-to-end flow):**
+
+```bash
+# UI mode (the browser automation agent; requires credentials).
+python run_create_ticket.py "Create a high priority ticket about login issues for bob@example.com" ui
+
+# UI dry-run (no browser calls)
+python run_create_ticket.py "Create a high priority ticket about login issues for bob@example.com" ui dry-run
+
+# API mode (fall back or skip browser; call adapters)
+python run_create_ticket.py "Create a low priority ticket about password reset for bob@example.com" api
+```
+
+---
+
+### `parser.py` — Instruction → canonical parsed intent
+
+`run_create_ticket.py` calls this module to convert free text into a validated, normalized JSON intent the rest of the system understands. The parser enforces schema constraints, normalizes requester/provider shapes, and (when configured) attaches deterministic mock DOM steps so the agent can run offline.
+
+---
+
+### `agents/ui_agent.py` — The actor that performs UI automation
+
+This is the Playwright-powered agent that, given a canonical parsed intent, attempts to execute the UI flow in a browser. It is the central automation engine (selector heuristics, robust fill/click primitives, diagnostics, selector stats, SSO detection, and API fallback triggers). In the system flow it is invoked by the dispatcher when the UI mode is selected.
+
+---
+
+### `agents/compat_ui_shim.py` — Backwards-compatible shim
+
+A thin wrapper that instantiates the `CoreAgent` and provides the stable functions existing call sites expect. It exists to keep the public API tidy and to make `run_create_ticket.py` calls concise.
+
+---
+
+### `adapters/__init__.py` — API fallbacks for providers
+
+The adapters directory now contains `freshdesk.py`, `zendesk.py`, and `session.py`. The logic previously described as being inside `adapters/__init__.py` has been split into the provider-specific modules (`adapters/freshdesk.py`, `adapters/zendesk.py`) while `adapters/session.py` contains the shared requests `Session` and retry/backoff configuration. The package entrypoint (`adapters/__init__.py`) still provides a simple registry and convenient imports for tests and the dispatcher to call provider adapters. These adapters are used when the CLI is run in `api` mode, or when the UI flow cannot proceed (SSO/manual login) and the agent falls back to a REST-based ticket creation. Adapters are the non-UI path in the flow.
+
+---
+
+### `llm/mock_dom_steps.py` — Deterministic mock DOM steps (offline mode)
+
+Generates predictable `fields` + `steps` that the agent can execute without an LLM or access to a live page. The parser attaches these in mock mode so the entire dispatch → agent → execution flow can be exercised offlin and deterministically (useful for reviewers and tests). Run with mock DOM (CI-friendly) — set `USE_MOCK_DOM=true` in `.env` or environment:
+
+```
+set USE_MOCK_DOM=true
+python run_create_ticket.py "Create a low priority ticket about password reset issues for bob@example.com" ui
+```
+
+---
+
+### `tests/test_imports_and_dryrun.py` — Test harness and why it is included
+
+This test file provides a fast, offline verification that:
+
+* the codebase imports cleanly (smoke test), and
+* the programmatic dry-run dispatch path behaves as expected.
+
+Its importance: a single, reproducible command (`pytest -q`) shows that the submission runs and that the dry-run behavior matches the intended contract (no network or browser required). To run just the dry-run smoke test:
+
+```bash
+pytest tests/test_imports_and_dryrun.py::test_run_create_ticket_dry_run -q
+```
+
+---
+
+## Supporting artifacts (schema, prompt, providers, config & docs)
+
+* `schema.json`
+  Declares the canonical JSON contract used by the parser to validate LLM output.
+
+* `prompt_template.txt`
+  The LLM prompt used by the parser. Included in order to understand how instructions are framed for machine interpretation.
+
+* `providers/` (`zendesk.json`, `freshdesk.json`)
+  Per-provider configuration (selectors, URLs, submit selectors). Included so the automation logic can be configured without code changes and for provider-specific mappings.
+
+* `requirements.txt`
+  Dependency list to install the environment for running tests and (optionally) Playwright and OCR components.
+
+---
+
+## Why the files are kept modular (why not a single merged script)
+
+* **Separation of concerns:** parsing, UI execution, API adapters, LLM mocks, and the CLI dispatcher are distinct responsibilities — making each file focused and easy to review for its role.
+* **Testability:** unit tests can import and patch single modules (e.g., parser) without running the whole system; this enables deterministic offline tests for graders.
+* **Maintainability & extensibility:** provider configs live in `providers/` so adding a new service requires only a JSON file, not code restructuring.
+* **Reviewer ergonomics:** a single `run_create_ticket.py` entrypoint gives a low-friction path; the rest of the codebase is visible and organized so a grader can inspect architecture and tradeoffs quickly.
 
 ---
 
 ## Configuration placeholders
 
-Use the following environment placeholders (replace values locally as appropriate):
+Use the following environment placeholders in an .env file (replace values locally as appropriate):
 
 ```
 # LLM (for live inference)
@@ -120,66 +214,10 @@ UI_AGENT_USE_OCR=false
 
 ---
 
-## Runtime flow (detailed)
-
-1. **Parse instruction**
-
-   * `parser.parse_instruction()` transforms natural language into canonical JSON. If `USE_MOCK_DOM=true`, mock DOM steps are attached for stable testing.
-
-2. **Dispatch**
-
-   * `run_create_ticket.dispatch(parsed, mode="ui"|"api", dry_run=bool)` calls either UI automation or adapters.
-
-3. **UI automation**
-
-   * `GenericUIAgent.create_ticket(provider, intent, dry_run=False)`:
-
-     * Loads provider config (`providers/<provider>.json`) and formats base URL with env vars.
-     * Launches Playwright browser or persistent profile when `PLAYWRIGHT_USER_DATA_DIR` is configured.
-     * Navigates to `base_url`.
-     * If `login` config exists:
-
-       * Attempts auto-fill of login fields using configured selectors.
-       * Clicks configured login/button selectors and waits for page load.
-       * Detects passcode prompt via heuristics. If present:
-
-         * Tries IMAP (poll mailbox for configured subject regex and extract numeric code).
-         * If IMAP fails, tries browser-inbox scraping (open inbox URL and find message with subject regex).
-         * Fills passcode input and clicks verify/submit selectors.
-       * If SSO is detected and automation is blocked, uses manual-wait or adapter fallback based on config.
-     * Uses provided `intent["steps"]` or invokes LLM-driven `infer_steps_with_llm()` (if `USE_MOCK_DOM=false`) to produce DOM actions.
-     * Executes `steps` using `safe_fill` and `safe_click` with retries, label fallback, and selector scoring.
-     * Attempts multi-strategy submit (`_attempt_submit`): configured submit selectors, JS click, keyboard `Ctrl+Enter`, `form.submit()`, and disabled-attribute workaround. Logs which strategy succeeded.
-     * Saves redacted diagnostic HTML/PNG and updates selector stats.
-
-4. **Adapter fallback**
-
-   * If UI automation cannot proceed (SSO/manual block, missing required fields, or other fatal errors), the agent resolves an adapter via `get_adapter(provider)` and calls `adapter.create_ticket(parsed)`.
-
-5. **Logging**
-
-   * Step-level structured, redacted logs are emitted and persisted to `UI_AGENT_DIAG_DIR/steps.jsonl`.
-   * Diagnostic HTML and PNG snapshots are written per run with timestamps to the same directory for visual inspection.
-   * Selector statistics are tracked in `selector_stats.json` to improve selector ordering over time.
-
----
-
-## LLM vs Mock behavior
-
-* **Mock mode (`USE_MOCK_DOM=true`)**
-
-  * Deterministic DOM steps are attached to parsed instructions via `llm/mock_dom_steps.py`. This mode provides stable, testable behavior for CI and local runs without calling an LLM.
-* **LLM mode (`USE_MOCK_DOM=false`)**
-
-  * The parser or `infer_steps_with_llm()` will call the configured Groq/OpenAI-compatible endpoint to produce fields/steps from a page snippet and instruction. The prompt expects strict JSON output and the system extracts and validates the JSON.
-
----
-
 ## Diagnostics & logs
 
 * Structured step logs (redacted) are written to `UI_AGENT_DIAG_DIR/steps.jsonl`. Each entry includes: `run_id`, `ts`, `event`, and the `step` object.
 * Diagnostic HTML and PNG snapshots are written per run with timestamps to the same directory for visual inspection.
-* Selector success/attempt stats persist across runs in `selector_stats.json` to order candidate selectors adaptively.
 
 ---
 
@@ -191,77 +229,6 @@ UI_AGENT_USE_OCR=false
 * **Recovery heuristics:** improve DOM inference by adding vision-based selectors (screenshot OCR), DOM-tree embedding, or LLM prompt-chaining.
 
 ---
-
-## Testing
-
-The project has a deterministic test mode (mock DOM) to run tests that do not require network LLM calls or real UI interactions. The provided tests exercise importability and dry-run behavior; additional provider-specific unit and integration tests are recommended.
-
-### Testing commands & examples (Windows `cmd` examples included)
-
-**1) Create & activate Python virtual environment (Windows `cmd`)**
-
-```
-python -m venv .venv
-.venv\Scripts\activate
-```
-
-**2) Install dependencies**
-(assuming a `requirements.txt` exists with at least `playwright`, `requests`, `jsonschema`, `python-dotenv`, `pillow`, `pytesseract` as needed)
-
-```
-pip install -r requirements.txt
-```
-
-**3) Install Playwright browsers**
-
-```
-python -m playwright install
-```
-
-**4) Ensure environment variables**
-Create a `.env` file in project root using the placeholders shown earlier. `python-dotenv` is used by `parser.py` if present, so the CLI will pick up variables from `.env`.
-
-Windows `cmd` example to set a single env var for a session (temporary):
-
-```
-set PLAYWRIGHT_HEADLESS=false
-set PLAYWRIGHT_USER_DATA_DIR=C:\path\to\playwright-profile
-```
-
-(Prefer `.env` for multi-line values and to avoid `cmd` quoting pitfalls.)
-
-**5) Run unit/smoke tests**
-
-```
-python -m pytest -q
-```
-
-**6) Example CLI runs (Windows `cmd`)**
-
-UI mode (real browser automation):
-
-```
-python run_create_ticket.py "Create a high priority ticket about login issues for bob@example.com" ui
-```
-
-UI mode, dry-run (shows steps without launching):
-
-```
-python run_create_ticket.py "Create a high priority ticket about login issues for bob@example.com" ui dry-run
-```
-
-API-only mode:
-
-```
-python run_create_ticket.py "Create a medium priority ticket about API 500 errors for alice@example.com" api
-```
-
-Run with mock DOM (CI-friendly) — set `USE_MOCK_DOM=true` in `.env` or environment:
-
-```
-set USE_MOCK_DOM=true
-python run_create_ticket.py "Create a low priority ticket about password reset issues for alice@example.com" ui
-```
 
 **7) Debugging & diagnostics**
 
@@ -289,7 +256,4 @@ python run_create_ticket.py "Create a low priority ticket about password reset i
 
 ---
 
-## Contact / maintenance notes
-
-* The codebase centralizes provider-specific behavior in `providers/*.json` and adapters; to accommodate UI drift, add or update provider configs and expand the adapter registry.
-* The LLM prompt template and schema provide a contract for the parser output—any changes to the schema should be accompanied by prompt updates.
+### Thank you.

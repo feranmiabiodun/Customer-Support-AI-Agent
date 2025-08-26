@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Generate deterministic, mock DOM 'steps' for a parsed ticket object.
 Used in USE_MOCK_DOM mode for deterministic dry-run and tests.
