@@ -36,30 +36,29 @@ Stretch features implemented:
 
 ```
 
-├─ run\_create\_ticket.py
+├─ run_create_ticket.py
 ├─ parser.py
-├─ agents/
-│  ├─ **init**.py
-│  ├─ ui\_agent.py
-│  └─ compat\_ui\_shim.py
-├─ adapters/
-│  ├─ **init**.py
+├─ agents
+│  ├─ __init__.py
+│  ├─ ui_agent.py
+│  └─ compat_ui_shim.py
+├─ adapters
+│  ├─ __init__.py
 │  ├─ freshdesk.py
 │  ├─ zendesk.py
 │  └─ session.py
-├─ llm/
-│  ├─ **init**.py
-│  └─ mock\_dom\_steps.py
-├─ tests/
-│  ├─ test\_imports\_and\_dryrun.py
-│  └─ test\_adapters.py
+├─ llm
+│  ├─ __init__.py
+│  └─ mock_dom_steps.py
+├─ tests
+│  ├─ test_imports_and_dryrun.py
+│  └─ test_adapters.py
 ├─ schema.json
-├─ prompt\_template.txt
-├─ providers/
+├─ prompt_template.txt
+├─ providers
 │  ├─ zendesk.json
 │  └─ freshdesk.json
 ├─ requirements.txt
-├─ .env.example
 └─ README.md
 
 ```
@@ -107,7 +106,7 @@ A thin wrapper that instantiates the `CoreAgent` and provides the stable functio
 
 ### `adapters/__init__.py` — API fallbacks for providers
 
-The adapters directory now contains `freshdesk.py`, `zendesk.py`, and `session.py`. The logic previously described as being inside `adapters/__init__.py` has been split into the provider-specific modules (`adapters/freshdesk.py`, `adapters/zendesk.py`) while `adapters/session.py` contains the shared requests `Session` and retry/backoff configuration. The package entrypoint (`adapters/__init__.py`) still provides a simple registry and convenient imports for tests and the dispatcher to call provider adapters. These adapters are used when the CLI is run in `api` mode, or when the UI flow cannot proceed (SSO/manual login) and the agent falls back to a REST-based ticket creation. Adapters are the non-UI path in the flow.
+The adapters directory now contains `freshdesk.py`, `zendesk.py`, and `session.py`. The logic previously described as being inside `adapters__init__.py` has been split into the provider-specific modules (`adapters/freshdesk.py`, `adapters/zendesk.py`) while `adapters/session.py` contains the shared requests `Session` and retry/backoff configuration. The package entrypoint (`adapters__init__.py`) still provides a simple registry and convenient imports for tests and the dispatcher to call provider adapters. These adapters are used when the CLI is run in `api` mode, or when the UI flow cannot proceed (SSO/manual login) and the agent falls back to a REST-based ticket creation. Adapters are the non-UI path in the flow.
 
 ---
 
@@ -157,7 +156,7 @@ pytest tests/test_imports_and_dryrun.py::test_run_create_ticket_dry_run -q
 
 * **Separation of concerns:** parsing, UI execution, API adapters, LLM mocks, and the CLI dispatcher are distinct responsibilities — making each file focused and easy to review for its role.
 * **Testability:** unit tests can import and patch single modules (e.g., parser) without running the whole system; this enables deterministic offline tests for graders.
-* **Maintainability & extensibility:** provider configs live in `providers/` so adding a new service requires only a JSON file, not code restructuring.
+* **Maintainability & extensibility:** provider configs live in `providers` so adding a new service requires only a JSON file, not code restructuring.
 * **Reviewer ergonomics:** a single `run_create_ticket.py` entrypoint gives a low-friction path; the rest of the codebase is visible and organized so a grader can inspect architecture and tradeoffs quickly.
 
 ---
@@ -224,7 +223,7 @@ UI_AGENT_USE_OCR=false
 ## Extensibility
 
 * **Add a new provider:** drop a `providers/<name>.json` file describing `base_url`, `login` selectors, `fields`, `open_new_selectors`, `submit_selectors`, and optional `passcode_*` entries. The agent uses provider configs to guide heuristics and LLM prompts.
-* **Adapter plugin:** implement an adapter class that exposes `create_ticket(payload)` and register it in `adapters/__init__.py` with `get_adapter("<name>")`.
+* **Adapter plugin:** implement an adapter class that exposes `create_ticket(payload)` and register it in `adapters__init__.py` with `get_adapter("<name>")`.
 * **LLM improvements:** tune `prompt_template.txt`, increase validation in `parser.py`, and add confidence checks / ambiguity metadata.
 * **Recovery heuristics:** improve DOM inference by adding vision-based selectors (screenshot OCR), DOM-tree embedding, or LLM prompt-chaining.
 
@@ -232,7 +231,7 @@ UI_AGENT_USE_OCR=false
 
 **7) Debugging & diagnostics**
 
-* Diagnostic snapshots and step logs are placed in `UI_AGENT_DIAG_DIR` (default `./ui_agent_diag`) — review the latest `zendesk_*.html` / `freshdesk_*.html` and `steps.jsonl`.
+* Diagnostic snapshots and step logs are placed in `UI_AGENT_DIAG_DIR` (default `ui_agent_diag`) — review the latest `zendesk_*.html` / `freshdesk_*.html` and `steps.jsonl`.
 * If Playwright persistent context fails due to an improperly set `PLAYWRIGHT_USER_DATA_DIR`, check the value and ensure the directory path exists and does not contain stray quoting.
 
 ---
