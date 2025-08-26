@@ -104,9 +104,15 @@ A thin wrapper that instantiates the `CoreAgent` and provides the stable functio
 
 ---
 
-### `adapters/__init__.py` — API fallbacks for providers
+### `adapters` — provider API modules
 
-The adapters directory now contains `freshdesk.py`, `zendesk.py`, and `session.py`. The logic previously described as being inside `adapters__init__.py` has been split into the provider-specific modules (`adapters/freshdesk.py`, `adapters/zendesk.py`) while `adapters/session.py` contains the shared requests `Session` and retry/backoff configuration. The package entrypoint (`adapters__init__.py`) still provides a simple registry and convenient imports for tests and the dispatcher to call provider adapters. These adapters are used when the CLI is run in `api` mode, or when the UI flow cannot proceed (SSO/manual login) and the agent falls back to a REST-based ticket creation. Adapters are the non-UI path in the flow.
+The `adapters` directory contains three explicit modules:
+
+* `adapters/freshdesk.py` — Freshdesk API adapter. Implements `FreshdeskAdapter` with a `create_ticket(payload)` method that uses the shared HTTP session helpers in `adapters/session.py`. Reads `FRESHDESK_DOMAIN` and `FRESHDESK_API_KEY` from environment (supports refreshing config if `.env` is loaded at runtime). Returns normalized responses like `{"status":"ok","ticket_id": ...}` or `{"status":"error", "code": ..., "body": ...}`.
+
+* `adapters/zendesk.py` — Zendesk API adapter. Implements `ZendeskAdapter` with a `create_ticket(payload)` method that uses `adapters/session.py` for HTTP with retries. Reads `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`, and `ZENDESK_API_TOKEN` from environment and returns normalized responses like the Freshdesk adapter.
+
+* `adapters/session.py` — Shared `requests.Session` and HTTP helpers. Defines `session()` (returns a `requests.Session` with optional `urllib3` Retry), `DEFAULT_REQUEST_TIMEOUT`, and `DEBUG_RETURN_RAW` flags used by both adapters.
 
 ---
 
