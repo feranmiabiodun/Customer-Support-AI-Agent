@@ -142,6 +142,12 @@ pytest tests/test_imports_and_dryrun.py::test_run_create_ticket_dry_run -q
 
 ---
 
+### `tests/test_adapters.py` — Adapter-level tests
+
+This file contains unit tests for `FreshdeskAdapter` and `ZendeskAdapter`, verifying that they correctly handle environment configuration, priority/status mapping, successful ticket creation (with monkeypatched responses), and error conditions, ensuring consistent and predictable behavior without making real API calls.
+
+---
+
 ## Supporting artifacts (schema, prompt, providers, config & docs)
 
 * `schema.json`
