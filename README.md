@@ -1,4 +1,4 @@
-# Universal UI Agent - Abiodun Adeagbo's submission
+# Customer Support AI Agent
 
 ## Overview
 
